@@ -21,19 +21,39 @@ struct InternetHandle {
 };
 using Handle=std::unique_ptr<void,InternetHandle>;
 
-std::string request(const wchar_t* host,const std::string& path,size_t limit,const std::atomic<bool>& stop) {
+std::string request(const wchar_t* host,const std::string& path,size_t limit,const std::atomic<bool>& stop);
+std::string request(const wchar_t* host,const std::string& path,size_t limit,const std::atomic<bool>& stop,int redirects) {
     Handle session(WinHttpOpen(L"FL Plugin Atlas/1.0",WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,nullptr,nullptr,0));
     if(!session) throw std::runtime_error("网络不可用");
     WinHttpSetTimeouts(session.get(),3000,3000,4000,4000);
     Handle connection(WinHttpConnect(session.get(),host,INTERNET_DEFAULT_HTTPS_PORT,0));
     auto target=fs::u8path(path).wstring();
     Handle req(WinHttpOpenRequest(connection.get(),L"GET",target.c_str(),nullptr,nullptr,nullptr,WINHTTP_FLAG_SECURE));
-    DWORD redirects=WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
-    if(!req || !WinHttpSetOption(req.get(),WINHTTP_OPTION_REDIRECT_POLICY,&redirects,sizeof redirects) ||
+    DWORD policy=WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+    if(!req || !WinHttpSetOption(req.get(),WINHTTP_OPTION_REDIRECT_POLICY,&policy,sizeof policy) ||
        !WinHttpSendRequest(req.get(),nullptr,0,nullptr,0,0,0) || !WinHttpReceiveResponse(req.get(),nullptr))
         throw std::runtime_error("联网获取失败");
     DWORD code=0,size=sizeof code;
     WinHttpQueryHeaders(req.get(),WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER,nullptr,&code,&size,nullptr);
+    if((code==301 || code==302 || code==303 || code==307 || code==308) && redirects<2) {
+        wchar_t location[2048]{};
+        DWORD bytes=sizeof location;
+        if(!WinHttpQueryHeaders(req.get(),WINHTTP_QUERY_LOCATION,WINHTTP_HEADER_NAME_BY_INDEX,location,&bytes,WINHTTP_NO_HEADER_INDEX))
+            throw std::runtime_error("图片服务暂时不可用");
+        std::wstring next=location;
+        auto scheme=next.find(L"://");
+        if(scheme!=next.npos) {
+            auto slash=next.find(L'/',scheme+3);
+            next=slash==next.npos?L"/" : next.substr(slash);
+        }
+        if(next.empty() || next[0]!=L'/') throw std::runtime_error("图片服务暂时不可用");
+        std::string narrowed;
+        for(wchar_t c:next) {
+            if(c<32 || c>126) throw std::runtime_error("图片服务暂时不可用");
+            narrowed+=static_cast<char>(c);
+        }
+        return request(host,narrowed,limit,stop,redirects+1);
+    }
     if(code==404) return {};
     if(code!=200) throw std::runtime_error("图片服务暂时不可用");
     std::string bytes;
@@ -46,6 +66,9 @@ std::string request(const wchar_t* host,const std::string& path,size_t limit,con
         bytes.append(buffer,n);
     }
     return {};
+}
+std::string request(const wchar_t* host,const std::string& path,size_t limit,const std::atomic<bool>& stop) {
+    return request(host,path,limit,stop,0);
 }
 
 std::string slug(const std::string& s) {
@@ -106,6 +129,7 @@ std::string encode_query(const std::string& text) {
     std::string out;
     for(unsigned char c:text) {
         if(std::isalnum(c) || c=='-' || c=='_' || c=='.') out+=char(c);
+        else if(c==' ') out+='+';
         else {out+='%'; out+=hex[c>>4]; out+=hex[c&15];}
     }
     return out;
@@ -285,7 +309,6 @@ Report fill(const fs::path& library,const std::vector<flcat::Entry>& entries,con
         std::map<std::string,std::string> links;
         try {links=products(brand,stop);}
         catch(const std::exception&) {report.errors++;}
-        int failures=0;
         for(const auto& [name,query]:names) {
             if(stop) return report;
             Product p{brand,name};
@@ -295,14 +318,13 @@ Report fill(const fs::path& library,const std::vector<flcat::Entry>& entries,con
                 if(fs::is_regular_file(dest) && check.load(dest)) continue;
                 if(fresh_miss(p)) {report.missing++; continue;}
                 if(lookup(p,query,links,dest,stop)) {
-                    report.saved++; failures=0;
+                    report.saved++;
                     std::error_code ec; fs::remove(miss_path(p),ec);
                 } else if(!stop) {
                     report.missing++; note_miss(p);
                 }
             } catch(const std::exception&) {
                 report.errors++;
-                if(++failures>=5) break;
             }
         }
         std::clog<<"artwork "<<brand<<" total saved "<<report.saved<<" missing "<<report.missing<<"\n"<<std::flush;

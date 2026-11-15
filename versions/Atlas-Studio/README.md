@@ -2,11 +2,11 @@
 
 这是原项目的独立界面副本，源码位于 `versions/Atlas-Studio`。采用不透明石墨灰分区、暖琥珀强调色和原生 Windows 控件。
 
-直接打开 `dist/Atlas Studio Preview.exe` 可查看可交互的样本界面，使用自动清理的临时目录。厂商、用途、类型、搜索与批量分类均可操作；扫描、图片和宿主加载按钮会说明如何使用正式 CLAP。样本 `.fst` 不是真实预设。
+直接打开 `build/Release/Atlas Studio Preview.exe` 可查看可交互的样本界面，使用自动清理的临时目录。厂商、用途、类型、搜索与批量分类均可操作；扫描、图片和宿主加载按钮会说明如何使用正式 CLAP。样本 `.fst` 不是真实预设。
 
-实际插件为 `dist/FL Plugin Atlas Studio.clap`，名称与 CLAP ID 均独立。原版和 Studio 在正式宿主中沿用同一套本地分类数据。此副本已完成原生测试宿主验证，尚未在 FL Studio 内验证新版加载操作。
+实际插件为 `build/Release/FL Plugin Atlas Studio.clap`，名称与 CLAP ID 均独立。原版和 Studio 在正式宿主中沿用同一套本地分类数据。此副本已完成原生测试宿主验证，尚未在 FL Studio 内验证新版加载操作。
 
-可编辑设计稿：[Figma · Atlas Studio](https://www.figma.com/design/7vrUL0HJx1OBA5ppzJQEsa?node-id=5-152)。原生截图与检查结果见 `review/` 和 `DESIGN.md`。
+可编辑设计稿：[Figma · Atlas Studio](https://www.figma.com/design/7vrUL0HJx1OBA5ppzJQEsa?node-id=5-152)。本地界面测试输出位于 `review/`，设计说明见 `DESIGN.md`。
 
 
 插件图谱——面向 Windows 桌面版 FL Studio 的插件分类管理器。
@@ -59,4 +59,3 @@ cmake -E chdir build ctest -C Release --output-on-failure
 ```
 
 首次配置 Windows 构建时，CMake 会获取固定版本的 CLAP 头文件。离线构建可用 `-DCLAP_SDK_DIR=已有SDK目录`。插件输出与 CLI 位于同一构建目录。当前面板支持浏览与分类，发布到 FL 收藏目录仍待实现。架构约束见 [AGENTS.md](AGENTS.md)。
-

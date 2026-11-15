@@ -1,0 +1,33 @@
+FL Plugin Atlas 0.1.0
+Windows 10 / 11 x64 · FL Studio CLAP 插件
+
+安装与打开
+1. 关闭 FL Studio，运行安装包并允许管理员确认。
+2. 打开 FL Studio，在 Options > Manage plugins 中运行 Find installed plugins。
+3. 在 Mixer 空效果插槽中选择 More plugins > FL Plugin Atlas。
+4. 点击“扫描插件”，或用“选择目录”指定自己的 Plugin database。
+
+浏览与使用
+选择厂商、用途，或输入关键词查找插件。点击“全部”显示当前厂商的所有用途。
+选中预设后，点击预览上方“添加到 FL”，再点击 Channel Rack 空白处或 Mixer 空插槽。
+按 Esc 或右键可取消。
+多选预设后，在底部输入用途或厂商名，再打开“编辑分类…”进行批量编辑。
+
+联网补图
+扫描完成后会按厂商和插件名称请求 plugin.watch 的产品图片。
+本地预设路径及工程内容不属于图片查询参数。
+用户可用“选择图片”指定本地图片。
+
+文件位置
+CLAP 插件安装在系统 Common Files\CLAP 目录。
+atlas.exe、文档和卸载程序安装在安装向导选择的目录。
+分类和图片缓存保存在当前用户的 LOCALAPPDATA\FL Plugin Atlas 目录。
+
+升级与卸载
+升级前关闭 FL Studio，然后运行新版安装包。
+在 Windows“已安装的应用”中卸载 FL Plugin Atlas。
+分类数据与图片缓存可继续用于重新安装。
+
+项目与反馈
+https://github.com/RainDp/FL-Plugin-Atlas
+https://github.com/RainDp/FL-Plugin-Atlas/issues
