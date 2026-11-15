@@ -1,0 +1,4 @@
+build/
+.playwright-mcp/
+dist/
+review/
