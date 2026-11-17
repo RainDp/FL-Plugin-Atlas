@@ -2,6 +2,7 @@
 #include <windows.h>
 #include "../plugin/ids.h"
 #include "../plugin/preset_drag.hpp"
+#include "plugin_sandbox.hpp"
 #include <shellapi.h>
 #include <stdexcept>
 #include <iostream>
@@ -44,6 +45,8 @@ int main(int argc,char** argv) {
         check(argc==2,"supply plugin path");
         HMODULE module=LoadLibraryW(std::filesystem::absolute(argv[1]).c_str());
         check(module,"LoadLibrary failed");
+        plugin_sandbox::Temporary sandbox;
+        plugin_sandbox::isolate(module,sandbox.path);
         auto entry=reinterpret_cast<const clap_plugin_entry_t*>(GetProcAddress(module,"clap_entry"));
         check(entry && entry->init(argv[1]),"entry init");
         auto factory=static_cast<const clap_plugin_factory_t*>(entry->get_factory(CLAP_PLUGIN_FACTORY_ID));

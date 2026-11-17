@@ -65,9 +65,9 @@ void GlassSurface::build(HWND dialog) {
     void* data=nullptr;
     auto bitmap=CreateDIBSection(nullptr,&info,DIB_RGB_COLORS,&data,nullptr,0);
     if(!bitmap) return;
-    RECT panes[]={{126,57,296,76},{174,291,323,311},{8,6,608,313}};
+    RECT panes[]={{126,57,322,76},{174,315,323,335},{8,6,608,337}};
     for(auto& r:panes) {MapDialogRect(dialog,&r);layout::scale_rect(r);}
-    RECT divisions{116,32,305,284};MapDialogRect(dialog,&divisions);layout::scale_rect(divisions);
+    RECT divisions{116,32,331,308};MapDialogRect(dialog,&divisions);layout::scale_rect(divisions);
     auto pixels=static_cast<uint32_t*>(data);
     const Texture texture(dialog);
     const double sx=double(texture.width)/w,sy=double(texture.height)/h;

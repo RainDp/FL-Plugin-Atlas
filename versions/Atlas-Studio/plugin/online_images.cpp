@@ -22,7 +22,7 @@ struct InternetHandle {
 using Handle=std::unique_ptr<void,InternetHandle>;
 
 std::string request(const wchar_t* host,const std::string& path,size_t limit,const std::atomic<bool>& stop);
-std::string request(const wchar_t* host,const std::string& path,size_t limit,const std::atomic<bool>& stop,int redirects) {
+std::string request(const wchar_t* host,const std::string& path,size_t limit,const std::atomic<bool>& stop,int redirects,int retries) {
     Handle session(WinHttpOpen(L"FL Plugin Atlas/1.0",WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,nullptr,nullptr,0));
     if(!session) throw std::runtime_error("网络不可用");
     WinHttpSetTimeouts(session.get(),3000,3000,4000,4000);
@@ -52,10 +52,14 @@ std::string request(const wchar_t* host,const std::string& path,size_t limit,con
             if(c<32 || c>126) throw std::runtime_error("图片服务暂时不可用");
             narrowed+=static_cast<char>(c);
         }
-        return request(host,narrowed,limit,stop,redirects+1);
+        return request(host,narrowed,limit,stop,redirects+1,retries);
+    }
+    if((code==429 || code==503) && retries<2 && !stop) {
+        Sleep(5000u*(retries+1));
+        return request(host,path,limit,stop,redirects,retries+1);
     }
     if(code==404) return {};
-    if(code!=200) throw std::runtime_error("图片服务暂时不可用");
+    if(code!=200) throw std::runtime_error("图片服务暂时不可用 ("+std::to_string(code)+")");
     std::string bytes;
     char buffer[16384];
     while(!stop) {
@@ -68,7 +72,7 @@ std::string request(const wchar_t* host,const std::string& path,size_t limit,con
     return {};
 }
 std::string request(const wchar_t* host,const std::string& path,size_t limit,const std::atomic<bool>& stop) {
-    return request(host,path,limit,stop,0);
+    return request(host,path,limit,stop,0,0);
 }
 
 std::string slug(const std::string& s) {
@@ -177,7 +181,7 @@ struct Hit {std::string brand,slug;};
 std::vector<Hit> search_hits(const std::string& query,const std::atomic<bool>& stop) {
     std::vector<Hit> hits;
     if(query.size()<3) return hits;
-    auto html=request(L"plugin.watch","/search?q="+encode_query(query.substr(0,80)),1024*1024,stop);
+    auto html=request(L"plugin.watch","/search?q="+encode_query(query.substr(0,80)),3*1024*1024,stop);
     const std::string prefix="href=\"/products/";
     for(size_t pos=0;(pos=html.find(prefix,pos))!=html.npos && hits.size()<40;) {
         auto link=between(html,prefix,"\"",pos);
@@ -267,7 +271,9 @@ bool download(const std::string& path,const fs::path& dest,const std::atomic<boo
     struct Cleanup {fs::path path; ~Cleanup(){std::error_code ec;fs::remove(path,ec);}} cleanup{temp};
     // JPEG is available even on Windows installs without an AVIF codec.
     for(auto size:{"md16x9.avif","share.jpg"}) {
-        auto bytes=request(L"images.plugin.watch",path+size,4*1024*1024,stop);
+        std::string bytes;
+        try {bytes=request(L"images.plugin.watch",path+size,4*1024*1024,stop);}
+        catch(const std::exception&) {continue;}
         if(stop) return false;
         if(bytes.empty()) continue;
         std::ofstream output(temp,std::ios::binary|std::ios::trunc);
@@ -308,24 +314,31 @@ Report fill(const fs::path& library,const std::vector<flcat::Entry>& entries,con
     for(auto& [brand,names]:wanted) {
         std::map<std::string,std::string> links;
         try {links=products(brand,stop);}
-        catch(const std::exception&) {report.errors++;}
+        catch(const std::exception& ex) {
+            report.errors++;
+            if(std::string(ex.what()).find("429")!=std::string::npos) return report;
+        }
         for(const auto& [name,query]:names) {
             if(stop) return report;
             Product p{brand,name};
+            bool fetched=false;
             try {
                 auto dest=cache_file(p);
                 PreviewImage check;
                 if(fs::is_regular_file(dest) && check.load(dest)) continue;
                 if(fresh_miss(p)) {report.missing++; continue;}
+                fetched=true;
                 if(lookup(p,query,links,dest,stop)) {
                     report.saved++;
                     std::error_code ec; fs::remove(miss_path(p),ec);
                 } else if(!stop) {
                     report.missing++; note_miss(p);
                 }
-            } catch(const std::exception&) {
+            } catch(const std::exception& ex) {
                 report.errors++;
+                if(std::string(ex.what()).find("429")!=std::string::npos) return report;
             }
+            if(fetched && !stop) Sleep(150);
         }
         std::clog<<"artwork "<<brand<<" total saved "<<report.saved<<" missing "<<report.missing<<"\n"<<std::flush;
     }

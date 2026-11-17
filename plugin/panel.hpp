@@ -1,5 +1,6 @@
 #pragma once
 #include <windows.h>
+#include <commctrl.h>
 #include <atomic>
 #include <future>
 #include "flcat/model.hpp"
@@ -20,10 +21,16 @@ public:
 private:
     std::vector<flcat::Entry> entries;
     std::vector<size_t> visible;
+    std::vector<std::string> visible_paths;
     std::optional<size_t> preview_index;
     PreviewImage image,previous_image;
     motion::Tween preview_blend{1};
-    std::array<motion::Button,7> buttons;
+    std::array<motion::Button,9> buttons;
+    HWND tooltips=nullptr;
+    std::wstring tooltip_text;
+    std::map<std::string,size_t> purpose_counts;
+    size_t matching_count=0;
+    bool updating_filters=false;
     bool buffered_paint=false;
     ULONG_PTR graphics_token=0;
     GlassSurface glass;
@@ -42,6 +49,9 @@ private:
     void complete();
     void load_filters();
     void filter();
+    void reset_filters();
+    void update_actions();
+    void tooltip(NMTTDISPINFOW& info);
     void edit(int command);
     void browse();
     void preview(std::optional<size_t> index);

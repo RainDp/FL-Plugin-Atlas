@@ -112,6 +112,42 @@ std::wstring label(HWND list, int index) {
     return value;
 }
 void status(HWND w,const std::wstring& s) { SetDlgItemTextW(w,STATUS,s.c_str()); }
+std::wstring purposes(const flcat::Entry& e) {
+    std::wstring value;
+    for(const auto& tag:e.tags) {if(!value.empty()) value+=L" · ";value+=wide(tag.first);}
+    return value.empty()?wide(flcat::unclassified):value;
+}
+std::wstring kind_name(const flcat::Entry& e) {
+    return e.kind=="Effects"?L"效果器":e.kind=="Generators"?L"乐器":L"类型未确认";
+}
+// Keep shortcuts inside this editor; do not intercept FL's host shortcuts.
+LRESULT CALLBACK panel_keys(HWND w,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR data) {
+    if(msg==WM_GETDLGCODE && lp) {
+        auto key=reinterpret_cast<MSG*>(lp)->wParam;
+        bool search=GetDlgCtrlID(w)==SEARCH_PLUGINS;
+        if((key=='F' && GetKeyState(VK_CONTROL)<0 && GetKeyState(VK_MENU)>=0) ||
+           (search && (key==VK_DOWN || (key==VK_ESCAPE && GetWindowTextLengthW(w)))))
+            return DefSubclassProc(w,msg,wp,lp)|DLGC_WANTMESSAGE;
+    }
+    if(msg==WM_KEYDOWN) {
+        auto parent=GetParent(w);
+        if(wp=='F' && GetKeyState(VK_CONTROL)<0 && GetKeyState(VK_MENU)>=0) {
+            auto search=GetDlgItem(parent,SEARCH_PLUGINS);
+            SetFocus(search);SendMessageW(search,EM_SETSEL,0,-1);return 0;
+        }
+        if(GetDlgCtrlID(w)==SEARCH_PLUGINS && wp==VK_ESCAPE && GetWindowTextLengthW(w)) {
+            SendMessageW(parent,WM_COMMAND,MAKEWPARAM(SEARCH_CLEAR,BN_CLICKED),0);return 0;
+        }
+        if(GetDlgCtrlID(w)==SEARCH_PLUGINS && wp==VK_DOWN) {
+            SetFocus(GetDlgItem(parent,RESULTS));return 0;
+        }
+    }
+    if(msg==WM_NCDESTROY) RemoveWindowSubclass(w,panel_keys,2);
+    auto result=DefSubclassProc(w,msg,wp,lp);
+    if(msg==WM_MOUSEMOVE && (GetDlgCtrlID(w)==RESULTS || GetDlgCtrlID(w)==PURPOSES) && data)
+        SendMessageW(reinterpret_cast<HWND>(data),TTM_UPDATE,0,0);
+    return result;
+}
 
 // Line icons share a 16-unit grid, including the search-field affordance.
 void icon(HDC dc,int id,int x,int y,int size,COLORREF color) {
@@ -143,6 +179,8 @@ void icon(HDC dc,int id,int x,int y,int size,COLORREF color) {
         for(float a:{2.f,10.f}) {line(a,2,a+4,2);line(a,14,a+4,14);}
         for(float a:{2.f,14.f}) {line(a,2,a,6);line(a,10,a,14);}
         line(4,8,12,8);
+    } else if(id==SEARCH_CLEAR) {
+        line(4,4,12,12);line(12,4,4,12);
     }
 }
 
@@ -264,6 +302,7 @@ void Panel::close() {
     job = {};
     if (window) {KillTimer(window,3);DestroyWindow(window);}
     window=nullptr;
+    tooltips=nullptr;tooltip_text.clear();purpose_counts.clear();matching_count=0;
     DeleteObject(heading); heading=nullptr;
     DeleteObject(bold); bold=nullptr;
     DeleteObject(display); display=nullptr;
@@ -272,6 +311,7 @@ void Panel::close() {
     DeleteObject(section); section=nullptr;
     DeleteObject(small); small=nullptr;
     preview_index.reset(); image={}; previous_image={}; preview_blend.reset(1);
+    entries.clear();visible.clear();visible_paths.clear();library_id.clear();updating_filters=false;
     glass.clear();
     if(buffered_paint) BufferedPaintUnInit();
     buffered_paint=false;
@@ -304,12 +344,15 @@ INT_PTR CALLBACK Panel::dialog(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             return reinterpret_cast<INT_PTR>(panel->glass.brush_for(dc,reinterpret_cast<HWND>(lp),w));
         }
         if(msg==WM_DRAWITEM) {panel->draw(*reinterpret_cast<DRAWITEMSTRUCT*>(lp)); return TRUE;}
+        if(msg==WM_NOTIFY && reinterpret_cast<NMHDR*>(lp)->code==TTN_GETDISPINFOW) {
+            panel->tooltip(*reinterpret_cast<NMTTDISPINFOW*>(lp));return TRUE;
+        }
         if (msg==WM_NCDESTROY) panel->window=nullptr;
         if (msg==WM_TIMER && wp==1) { panel->complete(); return TRUE; }
         if (msg==WM_TIMER && wp==2) { panel->finish_images(); return TRUE; }
         if (msg==WM_TIMER && wp==3) { panel->animate_preview(); return TRUE; }
         if(msg==WM_SETTINGCHANGE) {
-            for(int id:{BROWSE,FILL_IMAGES,SCAN,ADD_PLUGIN,IMAGE_PICK,IMAGE_RESET,EDIT_MENU})
+            for(int id:{BROWSE,FILL_IMAGES,SCAN,ADD_PLUGIN,IMAGE_PICK,IMAGE_RESET,EDIT_MENU,SEARCH_CLEAR,FILTER_RESET})
                 SendDlgItemMessageW(w,id,msg,wp,lp);
             panel->purposes_scroll.settings_changed();
             panel->results_scroll.settings_changed();
@@ -322,15 +365,21 @@ INT_PTR CALLBACK Panel::dialog(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         const auto id=LOWORD(wp);
         if (id==SCAN && HIWORD(wp)==BN_CLICKED) panel->scan();
         else if(id==SEARCH_ICON && HIWORD(wp)==STN_CLICKED) SetFocus(GetDlgItem(w,SEARCH_PLUGINS));
-        else if(id==SEARCH_PLUGINS && HIWORD(wp)==EN_CHANGE) panel->filter();
+        else if(id==SEARCH_PLUGINS && HIWORD(wp)==EN_CHANGE && !panel->updating_filters) panel->filter();
+        else if(id==VALUE && HIWORD(wp)==EN_CHANGE) panel->update_actions();
+        else if(id==SEARCH_CLEAR && HIWORD(wp)==BN_CLICKED) {
+            SetDlgItemTextW(w,SEARCH_PLUGINS,L"");SetFocus(GetDlgItem(w,SEARCH_PLUGINS));
+        }
+        else if(id==FILTER_RESET && HIWORD(wp)==BN_CLICKED) panel->reset_filters();
         else if(id==RESULTS && HIWORD(wp)==LBN_SELCHANGE) {
             auto list=GetDlgItem(w,RESULTS);
             auto sel=selected(list);
             int focus=static_cast<int>(SendMessageW(list,LB_GETCARETINDEX,0,0));
             if(!sel.empty() && SendMessageW(list,LB_GETSEL,focus,0)<=0) focus=sel.front();
             panel->preview(sel.empty()?std::nullopt:std::optional<size_t>(panel->visible.at(focus)));
+            panel->update_actions();
             if(!panel->job.valid() && !panel->image_job.valid())
-                status(w,L"已选择 "+std::to_wstring(sel.size())+L" 个预设");
+                status(w,L"已选 "+std::to_wstring(sel.size())+L" 个 · Ctrl / Shift 多选");
         }
         else if((id==IMAGE_PICK || id==IMAGE_RESET) && HIWORD(wp)==BN_CLICKED) panel->choose_image(id==IMAGE_RESET);
         else if (id==BROWSE && HIWORD(wp)==BN_CLICKED) panel->browse();
@@ -338,25 +387,30 @@ INT_PTR CALLBACK Panel::dialog(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         else if (id==PURPOSES && HIWORD(wp)==LBN_SELCHANGE) panel->filter();
         else if (id==ADD_PLUGIN && HIWORD(wp)==BN_CLICKED && panel->preview_index) {
             const auto& e=panel->entries.at(*panel->preview_index);
-            status(w,e.kind=="Effects"?L"点击 Mixer 空效果插槽，Esc 取消":L"点击 Channel Rack 空白处，Esc 取消");
+            status(w,e.kind=="Effects"?L"点击 Mixer 空效果插槽，Esc 取消":e.kind=="Generators"?
+                L"点击 Channel Rack 空白处，Esc 取消":L"点击 FL 中的目标位置，Esc 取消");
             UpdateWindow(GetDlgItem(w,STATUS));
             bool sent=place_preset(w,fs::u8path(panel->library_id),fs::u8path(e.path));
             if(IsWindow(w)) status(w,sent?L"预设已交给 FL Studio":L"已取消，或目标未接收预设");
         }
         else if(id==FILL_IMAGES && HIWORD(wp)==BN_CLICKED) panel->fill_images();
         else if (id==EDIT_MENU && HIWORD(wp)==BN_CLICKED) {
+            auto sel=selected(GetDlgItem(w,RESULTS));
+            std::set<std::string> keys;
+            for(int n:sel) keys.insert(panel->entries.at(panel->visible.at(n)).plugin_key);
             HMENU menu=CreatePopupMenu();
             if(!menu) throw std::runtime_error("无法打开分类菜单。");
-            AppendMenuW(menu,MF_STRING,ADD_TAG,L"添加用途");
-            AppendMenuW(menu,MF_STRING,REMOVE_TAG,L"移除用途");
+            AppendMenuW(menu,MF_STRING|(keys.empty()?MF_GRAYED:0),ADD_TAG,L"添加用途（保留原有标签）");
+            AppendMenuW(menu,MF_STRING|(keys.empty()?MF_GRAYED:0),REMOVE_TAG,L"移除用途");
             AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
-            AppendMenuW(menu,MF_STRING,SET_VENDOR,L"修正厂商");
-            AppendMenuW(menu,MF_STRING,ALIAS_VENDOR,L"合并厂商别名");
+            AppendMenuW(menu,MF_STRING|(keys.size()!=1?MF_GRAYED:0),SET_VENDOR,L"修正厂商");
+            AppendMenuW(menu,MF_STRING|(SendDlgItemMessageW(w,VENDORS,CB_GETCURSEL,0,0)<=0?MF_GRAYED:0),ALIAS_VENDOR,L"合并当前厂商别名");
             RECT bounds{}; GetWindowRect(GetDlgItem(w,EDIT_MENU),&bounds);
             auto action=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTALIGN|TPM_BOTTOMALIGN,
                 bounds.right,bounds.top,0,w,nullptr);
             DestroyMenu(menu);
             if(action) panel->edit(action);
+            else SetFocus(GetDlgItem(w,EDIT_MENU));
         }
         else return FALSE;
         return TRUE;
@@ -366,6 +420,8 @@ INT_PTR CALLBACK Panel::dialog(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     return TRUE;
 }
 void Panel::init() {
+    INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_WIN95_CLASSES|ICC_STANDARD_CLASSES};
+    InitCommonControlsEx(&controls);
     buffered_paint=SUCCEEDED(BufferedPaintInit());
     Gdiplus::GdiplusStartupInput graphics;
     Gdiplus::GdiplusStartup(&graphics_token,&graphics,nullptr);
@@ -431,11 +487,29 @@ void Panel::init() {
     SetWindowSubclass(GetDlgItem(window,VENDORS),vendor_face,1,reinterpret_cast<DWORD_PTR>(&glass));
     for(int id:{PURPOSES,RESULTS,VENDORS}) SetWindowTheme(GetDlgItem(window,id),L"DarkMode_Explorer",nullptr);
     size_t button=0;
-    for(int id:{BROWSE,FILL_IMAGES,SCAN,ADD_PLUGIN,IMAGE_PICK,IMAGE_RESET,EDIT_MENU})
+    for(int id:{BROWSE,FILL_IMAGES,SCAN,ADD_PLUGIN,IMAGE_PICK,IMAGE_RESET,EDIT_MENU,SEARCH_CLEAR,FILTER_RESET})
         buttons[button++].attach(GetDlgItem(window,id));
     for(int id:{SEARCH_PLUGINS,VALUE}) SetWindowSubclass(GetDlgItem(window,id),edit_hint,1,0);
     purposes_scroll.attach(GetDlgItem(window,PURPOSES),GetDlgItem(window,PURPOSE_SCROLL));
     results_scroll.attach(GetDlgItem(window,RESULTS),GetDlgItem(window,RESULT_SCROLL));
+    tooltips=CreateWindowExW(WS_EX_TOPMOST,TOOLTIPS_CLASSW,nullptr,WS_POPUP|TTS_ALWAYSTIP|TTS_NOPREFIX,
+                            CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,window,nullptr,
+                            reinterpret_cast<HINSTANCE>(&__ImageBase),nullptr);
+    if(tooltips) {
+        SendMessageW(tooltips,TTM_SETMAXTIPWIDTH,0,480);
+        SendMessageW(tooltips,TTM_SETDELAYTIME,TTDT_INITIAL,550);
+        SendMessageW(tooltips,TTM_SETDELAYTIME,TTDT_RESHOW,100);
+        for(int id:{RESULTS,PURPOSES,PREVIEW_NAME,PREVIEW_META,PREVIEW_TAGS,PREVIEW_PATH,STATUS,
+                    SEARCH_PLUGINS,SEARCH_CLEAR,FILTER_SUMMARY,FILTER_RESET,VALUE,EDIT_MENU,ADD_PLUGIN}) {
+            TOOLINFOW info{sizeof(info)};
+            info.uFlags=TTF_IDISHWND|TTF_SUBCLASS;
+            info.hwnd=window;info.uId=reinterpret_cast<UINT_PTR>(GetDlgItem(window,id));
+            info.lpszText=LPSTR_TEXTCALLBACKW;
+            SendMessageW(tooltips,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&info));
+        }
+    }
+    for(HWND child=GetWindow(window,GW_CHILD);child;child=GetWindow(child,GW_HWNDNEXT))
+        SetWindowSubclass(child,panel_keys,2,reinterpret_cast<DWORD_PTR>(tooltips));
     auto path=flcat::documents() / "Image-Line/FL Studio/Presets/Plugin database";
     SetDlgItemTextW(window,LIBRARY,path.c_str());
     library_id=flcat::path_id(fs::weakly_canonical(path));
@@ -490,6 +564,7 @@ void Panel::scan() {
     EnableWindow(GetDlgItem(window,FILL_IMAGES),FALSE);
     for(int control : {SCAN,BROWSE,LIBRARY,EDIT_MENU})
         EnableWindow(GetDlgItem(window,control),FALSE);
+    SetDlgItemTextW(window,SCAN,L"扫描中…");
     status(window,L"正在扫描插件库…");
 }
 void Panel::complete() {
@@ -498,7 +573,10 @@ void Panel::complete() {
     EnableWindow(GetDlgItem(window,FILL_IMAGES),TRUE);
     for(int control : {SCAN,BROWSE,LIBRARY,EDIT_MENU})
         EnableWindow(GetDlgItem(window,control),TRUE);
-    auto rows=job.get();
+    SetDlgItemTextW(window,SCAN,L"扫描插件");
+    auto task=std::move(job);
+    update_actions();
+    auto rows=task.get();
     library_id=flcat::path_id(fs::weakly_canonical(fs::absolute(fs::path(field(window,LIBRARY)))));
     entries=std::move(rows);
     load_filters();
@@ -513,13 +591,17 @@ void Panel::fill_images() {
         return artwork::fill(root,rows,stop_images);
     });
     EnableWindow(GetDlgItem(window,FILL_IMAGES),FALSE);
+    SetDlgItemTextW(window,FILL_IMAGES,L"查图中…");
     status(window,L"正在按厂商和插件名查找缺图…");
 }
 void Panel::finish_images() {
     if(!image_job.valid() || image_job.wait_for(std::chrono::seconds(0))!=std::future_status::ready) return;
     KillTimer(window,2);
     EnableWindow(GetDlgItem(window,FILL_IMAGES),!job.valid());
-    auto report=image_job.get();
+    SetDlgItemTextW(window,FILL_IMAGES,L"联网补图");
+    auto task=std::move(image_job);
+    update_actions();
+    auto report=task.get();
     if(stop_images) {if(!job.valid()) fill_images(); return;}
     preview(preview_index);
     status(window,L"新增 "+std::to_wstring(report.saved)+L" 张 · 未匹配 "+std::to_wstring(report.missing)+
@@ -556,16 +638,23 @@ void Panel::load_filters() {
     filter();
 }
 void Panel::filter() {
+    if(tooltips) SendMessageW(tooltips,TTM_POP,0,0);
     flcat::Filter f;
     auto query=field(window,SEARCH_PLUGINS);
     if(SendDlgItemMessageW(window,VENDORS,CB_GETCURSEL,0,0)>0) f.vendor=utf8(field(window,VENDORS));
-    HWND purposes=GetDlgItem(window,PURPOSES);
-    int purpose=static_cast<int>(SendMessageW(purposes,LB_GETCURSEL,0,0));
-    if(purpose>0) f.tags.push_back(utf8(label(purposes,purpose)));
+    HWND purpose_list=GetDlgItem(window,PURPOSES);
+    int purpose=static_cast<int>(SendMessageW(purpose_list,LB_GETCURSEL,0,0));
+    flcat::Filter purpose_filter;
+    if(purpose>0) purpose_filter.tags.push_back(utf8(label(purpose_list,purpose)));
     auto list=GetDlgItem(window,RESULTS);
+    std::set<std::string> keep;
+    for(int n:selected(list)) if(size_t(n)<visible_paths.size()) keep.insert(visible_paths[n]);
+    auto caret=SendMessageW(list,LB_GETCARETINDEX,0,0);
+    std::string focus=caret>=0 && size_t(caret)<visible_paths.size()?visible_paths[caret]:std::string{};
     SendMessageW(list,WM_SETREDRAW,FALSE,0);
     SendMessageW(list,LB_RESETCONTENT,0,0);
-    visible.clear();
+    visible.clear();visible_paths.clear();purpose_counts.clear();matching_count=0;
+    int retained=-1,focused=-1;
     for(size_t i=0;i<entries.size();++i) {
         const auto& e=entries[i];
         if(!f.matches(e)) continue;
@@ -575,18 +664,82 @@ void Panel::filter() {
                 s.data(),int(s.size()),query.data(),int(query.size()),nullptr,nullptr,nullptr,0)>=0;
         };
         if(!query.empty() && !contains(name) && !contains(vendor)) continue;
+        ++matching_count;
+        if(e.tags.empty()) ++purpose_counts[flcat::unclassified];
+        for(const auto& tag:e.tags) ++purpose_counts[tag.first];
+        if(!purpose_filter.matches(e)) continue;
         auto text=name+L"   ·   "+vendor+L"   ·   ";
         if(e.tags.empty()) text+=wide(flcat::unclassified);
         for(auto it=e.tags.begin();it!=e.tags.end();++it) { if(it!=e.tags.begin()) text+=L"、"; text+=wide(it->first); }
-        if(SendMessageW(list,LB_ADDSTRING,0,reinterpret_cast<LPARAM>(text.c_str()))>=0) visible.push_back(i);
+        auto row=SendMessageW(list,LB_ADDSTRING,0,reinterpret_cast<LPARAM>(text.c_str()));
+        if(row>=0) {
+            visible.push_back(i);visible_paths.push_back(e.path);
+            if(keep.count(e.path)) {
+                SendMessageW(list,LB_SETSEL,TRUE,row);
+                if(retained<0) retained=int(row);
+                if(e.path==focus) focused=int(row);
+            }
+        }
     }
-    if(!visible.empty()) SendMessageW(list,LB_SETSEL,TRUE,0);
-    preview(visible.empty()?std::nullopt:std::optional<size_t>(visible.front()));
+    if(!visible.empty() && retained<0) {SendMessageW(list,LB_SETSEL,TRUE,0);retained=0;}
+    if(focused<0) focused=retained;
+    if(focused>=0) SendMessageW(list,LB_SETCARETINDEX,focused,FALSE);
+    preview(focused<0?std::nullopt:std::optional<size_t>(visible[focused]));
     SendMessageW(list,WM_SETREDRAW,TRUE,0);
     InvalidateRect(list,nullptr,TRUE);
     ShowWindow(GetDlgItem(window,EMPTY_RESULTS),visible.empty()?SW_SHOWNOACTIVATE:SW_HIDE);
+    SetDlgItemTextW(window,EMPTY_RESULTS,entries.empty()?L"插件库尚未载入；选择目录或扫描插件":L"没有匹配的插件；调整搜索词或重置筛选");
+    ShowWindow(GetDlgItem(window,SEARCH_CLEAR),query.empty()?SW_HIDE:SW_SHOWNOACTIVATE);
     SetDlgItemTextW(window,RESULT_COUNT,(std::to_wstring(visible.size())+L" 个预设入口").c_str());
-    if(!job.valid() && !image_job.valid()) status(window,visible.empty()?L"":L"已选择 1 个预设");
+    auto summary=field(window,VENDORS)+L" · "+(purpose>0?label(purpose_list,purpose):L"全部用途");
+    SetDlgItemTextW(window,FILTER_SUMMARY,summary.c_str());
+    EnableWindow(GetDlgItem(window,FILTER_RESET),!query.empty() || f.vendor.has_value() || purpose>0);
+    InvalidateRect(purpose_list,nullptr,FALSE);
+    update_actions();
+    if(!job.valid() && !image_job.valid())
+        status(window,visible.empty()?L"调整筛选，或点击重置筛选":
+               L"已选 "+std::to_wstring(selected(list).size())+L" 个 · Ctrl / Shift 多选");
+}
+void Panel::reset_filters() {
+    updating_filters=true;
+    SetDlgItemTextW(window,SEARCH_PLUGINS,L"");
+    SendDlgItemMessageW(window,VENDORS,CB_SETCURSEL,0,0);
+    SendDlgItemMessageW(window,PURPOSES,LB_SETCURSEL,0,0);
+    updating_filters=false;
+    filter();SetFocus(GetDlgItem(window,SEARCH_PLUGINS));
+}
+void Panel::update_actions() {
+    auto value=field(window,VALUE);
+    bool entered=value.find_first_not_of(L" \t\r\n")!=std::wstring::npos;
+    bool selection=!selected(GetDlgItem(window,RESULTS)).empty();
+    bool vendor=SendDlgItemMessageW(window,VENDORS,CB_GETCURSEL,0,0)>0;
+    EnableWindow(GetDlgItem(window,EDIT_MENU),entered && (selection || vendor) && !job.valid());
+    EnableWindow(GetDlgItem(window,FILL_IMAGES),!entries.empty() && !job.valid() && !image_job.valid());
+}
+void Panel::tooltip(NMTTDISPINFOW& info) {
+    auto target=reinterpret_cast<HWND>(info.hdr.idFrom);
+    int id=GetDlgCtrlID(target);
+    tooltip_text.clear();
+    if(id==RESULTS) {
+        int row=results_scroll.hovered_row;
+        if(row>=0 && size_t(row)<visible.size()) {
+            const auto& e=entries[visible[row]];
+            tooltip_text=wide(e.name)+L"\n"+wide(e.vendor.empty()?flcat::unknown_vendor:e.vendor)+
+                L" · "+kind_name(e)+(e.format.empty()?L"":L" · "+wide(e.format))+L"\n"+
+                purposes(e)+L"\n"+wide(e.path);
+        }
+    } else if(id==PURPOSES) {
+        int row=purposes_scroll.hovered_row;
+        if(row>=0) tooltip_text=label(target,row)+L"（当前厂商与搜索条件下）";
+    } else if(id==SEARCH_PLUGINS) tooltip_text=L"按插件名或厂商搜索 · Ctrl+F 聚焦 · Esc 清空 · ↓ 进入列表";
+    else if(id==SEARCH_CLEAR) tooltip_text=L"清空关键词，保留厂商与用途（Esc）";
+    else if(id==FILTER_RESET) tooltip_text=L"清空搜索，恢复全部厂商与全部用途";
+    else if(id==VALUE || id==EDIT_MENU) tooltip_text=L"输入用途或厂商名称后编辑。Ctrl / Shift 可多选预设；添加用途会保留已有标签。";
+    else if(id==ADD_PLUGIN && preview_index) tooltip_text=entries[*preview_index].kind=="Effects"?
+        L"点击后，再点 FL Mixer 空效果插槽；Esc 取消":entries[*preview_index].kind=="Generators"?
+        L"点击后，再点 FL Channel Rack 空白处；Esc 取消":L"点击后，再点 FL 中的目标位置；Esc 取消";
+    else tooltip_text=field(window,id);
+    info.lpszText=tooltip_text.data();
 }
 void Panel::edit(int command) {
     auto value=utf8(field(window,VALUE));
@@ -617,13 +770,13 @@ void Panel::edit(int command) {
 void Panel::preview(std::optional<size_t> index) {
     bool changed=index!=preview_index;
     if(changed && preview_index && motion::enabled() && IsWindowVisible(window))
-        previous_image=PreviewImage::capture(GetDlgItem(window,PREVIEW),5);
+        previous_image=PreviewImage::capture(GetDlgItem(window,PREVIEW),7);
     else previous_image={};
     preview_blend.reset(1);KillTimer(window,3);
     preview_index=index;
     image={};
     const auto* e=index?&entries.at(*index):nullptr;
-    std::wstring source,meta,path;
+    std::wstring source,meta,path,tags;
     if(e) {
         if(!e->custom_image.empty() && image.load(fs::u8path(e->custom_image)))
             source=L"自选图片";
@@ -644,24 +797,27 @@ void Panel::preview(std::optional<size_t> index) {
         if(source.empty()) {
             auto cache=artwork::cached(*e);
             if(!cache.empty() && image.load(cache)) source=L"网络产品图";
-            else source=L"识别封面";
+            else source=L"暂无图片";
         }
-        meta=wide(e->vendor.empty()?flcat::unknown_vendor:e->vendor)+L" / "+
-             (e->kind=="Effects"?L"效果器":L"乐器");
-        if(!e->format.empty()) meta+=L" / "+wide(e->format);
+        meta=wide(e->vendor.empty()?flcat::unknown_vendor:e->vendor)+L" · "+kind_name(*e);
+        if(!e->format.empty()) meta+=L" · "+wide(e->format);
+        tags=purposes(*e);
         path=wide(e->path);
     }
     SetDlgItemTextW(window,PREVIEW_NAME,e?wide(e->name).c_str():L"未选择插件");
     if(!e) meta=entries.empty()?L"扫描插件后可查看预览":visible.empty()?L"试试其他关键词、厂商或用途":L"在列表中选择插件以查看预览";
     SetDlgItemTextW(window,PREVIEW_META,meta.c_str());
+    SetDlgItemTextW(window,PREVIEW_TAGS,tags.c_str());
+    SetDlgItemTextW(window,PREVIEW,e?(wide(e->name)+(image.pixels.empty()?L"：暂无预览图片":L"：预览图片")).c_str():L"尚未选择插件预览");
     SetDlgItemTextW(window,PREVIEW_PATH,path.c_str());
     SetDlgItemTextW(window,PREVIEW_SOURCE,source.c_str());
     EnableWindow(GetDlgItem(window,ADD_PLUGIN),e!=nullptr);
     EnableWindow(GetDlgItem(window,PREVIEW),e!=nullptr);
     EnableWindow(GetDlgItem(window,IMAGE_PICK),e!=nullptr);
     EnableWindow(GetDlgItem(window,IMAGE_RESET),e && !e->custom_image.empty());
-    if(e && image.pixels.empty() && !previous_image.pixels.empty())
-        image=PreviewImage::capture(GetDlgItem(window,PREVIEW),5);
+    // A missing-image hint is UI, not artwork. Capturing it into the next image
+    // repeatedly would inset the frame and misrepresent it as a loaded picture.
+    if(image.pixels.empty()) previous_image={};
     if(changed && !previous_image.pixels.empty() && !image.pixels.empty() && motion::enabled() && IsWindowVisible(window)) {
         preview_blend.reset(0);preview_blend.to(1,motion::preview_ms,true);
         if(!SetTimer(window,3,motion::frame_ms,nullptr)) preview_blend.finish();
@@ -736,24 +892,10 @@ void Panel::draw(const DRAWITEMSTRUCT& item) {
             SelectClipRgn(dc,nullptr);
             DeleteObject(clip);
         } else if(preview_index) {
-            const auto& entry=entries.at(*preview_index);
-            uint32_t seed=2166136261U;
-            for(unsigned char c:entry.plugin_key) seed=(seed^c)*16777619U;
-            int w=stage.right-stage.left,h=stage.bottom-stage.top;
-            int mid=stage.top+h/2;
-            int baseline=std::max(1,h/180);
-            fill(dc,{stage.left+w/12,mid,stage.right-w/12,mid+baseline},motion::mix(well,edge,.9));
-            // A deterministic signal print distinguishes entries without a screenshot.
-            for(int i=0;i<27;++i) {
-                double wave=std::abs(std::sin(i*(0.11+(seed%23)*0.015)+(seed%17))*
-                                     std::cos(i*0.074+((seed>>8)%11)));
-                int height=2+int(wave*h*.22);
-                int x=stage.left+(i+2)*w/31;
-                int bar=std::max(2,w/140);
-                fill(dc,{x,mid-height,x+bar,mid+height},motion::mix(subdued,signal,.25+wave*.7));
-            }
-            RECT cap{stage.left+12,stage.bottom-28,stage.right-12,stage.bottom-8};
-            text(L"识别封面",cap,muted,small,DT_RIGHT);
+            int cx=(stage.left+stage.right)/2,cy=(stage.top+stage.bottom)/2;
+            icon(dc,IMAGE_PICK,cx-15,cy-49,30,subdued);
+            text(L"暂无预览图片",{stage.left+10,cy-9,stage.right-10,cy+18},ink,body,DT_CENTER);
+            text(L"选择本地图片，或联网补图",{stage.left+10,cy+23,stage.right-10,cy+48},muted,small,DT_CENTER);
         } else {
             int mw=std::max(36L,(r.right-r.left)/7);
             int mh=mw*2/3;
@@ -781,12 +923,12 @@ void Panel::draw(const DRAWITEMSTRUCT& item) {
         if(item.CtlID==PREVIEW_SOURCE && !caption.empty()) {
             int dot=std::max(4L,(r.bottom-r.top)/6);
             int y=(r.top+r.bottom-dot)/2;
-            auto light=caption==L"识别封面"?subdued:signal;
+            auto light=caption==L"暂无图片"?subdued:signal;
             rounded(dc,{r.left,y,r.left+dot,y+dot},dot/2,light,light);
             r.left+=dot*2;
         }
         bool strong=item.CtlID==TITLE || item.CtlID==PREVIEW_NAME || item.CtlID==LIST_HEADING || item.CtlID==PREVIEW_HEADING;
-        text(caption,r,strong?ink:muted,font,DT_LEFT);
+        text(caption,r,strong?ink:item.CtlID==PREVIEW_TAGS?signal:muted,font,DT_LEFT);
     } else if(item.CtlType==ODT_LISTBOX) {
         if(item.itemID!=UINT(-1)) {
             auto& scroll=item.CtlID==RESULTS?results_scroll:purposes_scroll;
@@ -797,12 +939,6 @@ void Panel::draw(const DRAWITEMSTRUCT& item) {
                 auto opacity=BYTE(std::lround(228*strength+78*appearance.hover*(1-strength)));
                 glass_button(dc,chip,7,motion::mix(RGB(46,44,58),RGB(118,104,156),strength),
                              motion::mix(face,selection,strength),motion::mix(edge,selection_edge,strength),opacity);
-                if(strength>0.2) {
-                    int inset=std::max(5L,(chip.bottom-chip.top)/4);
-                    RECT bar{chip.left+5,chip.top+inset,chip.left+8,chip.bottom-inset};
-                    auto light=motion::mix(selection_edge,signal,strength);
-                    rounded(dc,bar,2,light,light);
-                }
             }
             r.left+=pad+8+int(std::lround(2*strength)); r.right-=8;
             if(item.CtlID==RESULTS && item.itemID<visible.size()) {
@@ -816,33 +952,11 @@ void Panel::draw(const DRAWITEMSTRUCT& item) {
                 InflateRect(&tile,-size/4,-size/4);
                 signal_mark(dc,tile,motion::mix(muted,signal,std::max(appearance.hover*.45,strength)),instrument,tileColor);
                 r.left+=size+pad;
-                bool known_vendor=!e.vendor.empty() && e.vendor!=flcat::unknown_vendor;
                 RECT top=r, bottom=r;
-                if(!e.tags.empty() || known_vendor) {
-                    top.bottom=r.top+(r.bottom-r.top)*58/100;
-                    bottom.top=top.bottom-1;
-                }
-                if(known_vendor) {
-                    auto vendor=wide(e.vendor);
-                    SelectObject(dc,small);
-                    SIZE extent{}; GetTextExtentPoint32W(dc,vendor.data(),int(vendor.size()),&extent);
-                    int width=std::min(int(extent.cx)+16,int(bottom.right-bottom.left));
-                    if(width>=36) {
-                        int mid=(bottom.top+bottom.bottom)/2;
-                        RECT badge{bottom.right-width,mid-extent.cy/2-2,bottom.right,mid+extent.cy/2+2};
-                        rounded(dc,badge,(badge.bottom-badge.top)/2,
-                                motion::mix(input_surface,selection,strength*.45),
-                                motion::mix(edge,selection_edge,strength));
-                        RECT label=badge; InflateRect(&label,-7,0);
-                        text(vendor,label,active?selected_text:muted,nullptr,DT_CENTER);
-                        bottom.right=badge.left-8;
-                    }
-                }
-                if(!e.tags.empty()) {
-                    std::wstring tags;
-                    for(const auto& tag:e.tags){if(!tags.empty()) tags+=L" / ";tags+=wide(tag.first);}
-                    text(tags,bottom,active?selected_text:muted,nullptr,DT_LEFT);
-                }
+                top.bottom=r.top+(r.bottom-r.top)*56/100;
+                bottom.top=top.bottom-1;
+                auto details=wide(e.vendor.empty()?flcat::unknown_vendor:e.vendor)+L" · "+purposes(e);
+                text(details,bottom,active?selected_text:muted,nullptr,DT_LEFT);
                 text(wide(e.name),top,ink,bold,DT_LEFT);
             } else if(item.CtlID==PURPOSES) {
                 auto caption=label(item.hwndItem,item.itemID);
@@ -851,6 +965,12 @@ void Panel::draw(const DRAWITEMSTRUCT& item) {
                 purpose_mark(dc,{r.left,y,r.left+size,y+size},caption,
                              motion::mix(muted,signal,appearance.selection));
                 r.left+=size+12;
+                auto count=std::to_wstring(item.itemID==0?matching_count:purpose_counts[utf8(caption)]);
+                SelectObject(dc,small);SIZE extent{};
+                GetTextExtentPoint32W(dc,count.data(),int(count.size()),&extent);
+                RECT number=r;number.left=std::max(r.left,r.right-extent.cx-2);
+                text(count,number,active?selected_text:muted,small,DT_RIGHT);
+                r.right=number.left-7;
                 text(caption,r,ink,active?bold:body,DT_LEFT);
             }
         }
@@ -860,7 +980,7 @@ void Panel::draw(const DRAWITEMSTRUCT& item) {
         auto animation=motion::Button::get(item.hwndItem);
         double hovered=animation?animation->hover.value():0,pressed=animation?animation->press.value():(active?1.:0.);
         double pointer=animation?animation->pointer.value():.5;
-        bool quiet=item.CtlID==IMAGE_RESET;
+        bool quiet=item.CtlID==IMAGE_RESET || item.CtlID==FILTER_RESET || item.CtlID==SEARCH_CLEAR;
         if(!disabled && (!quiet || pressed>0 || hovered>0)) {
             int inset=int(std::lround(pressed));
             InflateRect(&r,-inset,-inset);
@@ -879,7 +999,10 @@ void Panel::draw(const DRAWITEMSTRUCT& item) {
         auto caption=field(window,item.CtlID);
         auto fg=disabled?subdued:lead?on_signal:quiet?muted:ink;
         HFONT font=lead?bold:small;
-        if(!quiet && item.CtlID!=EDIT_MENU) {
+        if(item.CtlID==SEARCH_CLEAR) {
+            int glyph=std::max(12L,(r.bottom-r.top)*2/3);
+            icon(dc,SEARCH_CLEAR,(r.left+r.right-glyph)/2,(r.top+r.bottom-glyph)/2,glyph,fg);
+        } else if(!quiet && item.CtlID!=EDIT_MENU) {
             SIZE size{};SelectObject(dc,font);GetTextExtentPoint32W(dc,caption.data(),int(caption.size()),&size);
             int glyph=std::max(12L,size.cy-2), gap=6;
             int x=(r.left+r.right-size.cx-glyph-gap)/2;
